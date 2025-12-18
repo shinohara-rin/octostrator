@@ -98,6 +98,19 @@ function createTestServer(): McpServer {
         };
       }
 
+      const existingAgent = state.getAgentByName(agentName);
+      if (existingAgent) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Agent name '${agentName}' is already in use by agent '${existingAgent.id}'.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
       let targetAgent: state.Agent | undefined;
       if (agentId) {
         targetAgent = availableAgents.find((a) => a.id === agentId);
@@ -144,21 +157,28 @@ function createTestServer(): McpServer {
       title: "Update Task Status",
       description: "Report progress on current task.",
       inputSchema: {
+        agentId: z.string().describe("Your agent ID"),
         message: z.string().describe("Status message"),
       },
     },
-    async ({ message }: { message: string }) => {
-      const allAgents = state.getAllAgents();
-      const busyAgent = allAgents.find((a) => a.status === "busy" && a.currentTaskId);
+    async ({ agentId, message }: { agentId: string; message: string }) => {
+      const agent = state.getAllAgents().find((a) => a.id === agentId);
 
-      if (!busyAgent || !busyAgent.currentTaskId) {
+      if (!agent) {
+        return {
+          content: [{ type: "text", text: `Error: Agent '${agentId}' not found.` }],
+          isError: true,
+        };
+      }
+
+      if (!agent.currentTaskId) {
         return {
           content: [{ type: "text", text: "Error: No active task found." }],
           isError: true,
         };
       }
 
-      const success = state.updateTaskStatus(busyAgent.currentTaskId, message);
+      const success = state.updateTaskStatus(agent.currentTaskId, message);
 
       if (!success) {
         return {
@@ -168,7 +188,7 @@ function createTestServer(): McpServer {
       }
 
       return {
-        content: [{ type: "text", text: `Status updated for task ${busyAgent.currentTaskId}.` }],
+        content: [{ type: "text", text: `Status updated for task ${agent.currentTaskId}.` }],
       };
     }
   );
@@ -324,15 +344,47 @@ describe("MCP Tools", () => {
       expect(getResult(result).isError).toBe(true);
       expect(getResultText(result)).toContain("not available");
     });
+
+    it("should fail when agent name is already in use", async () => {
+      const agent1 = state.registerAgent();
+      state.registerAgent(); // Ensure another agent is available
+      const task = state.createTask("Task 1");
+      state.assignTaskToAgent(task.id, agent1.id, "ExistingName");
+
+      const { client } = await createConnectedClient();
+      const result = await client.callTool({
+        name: "delegate",
+        arguments: {
+          prompt: "Task 2",
+          agentName: "ExistingName",
+        },
+      });
+
+      expect(getResult(result).isError).toBe(true);
+      expect(getResultText(result)).toContain("already in use");
+    });
   });
 
   describe("status_update", () => {
-    it("should fail when no active task", async () => {
+    it("should fail when agent not found", async () => {
       const { client } = await createConnectedClient();
 
       const result = await client.callTool({
         name: "status_update",
-        arguments: { message: "Progress update" },
+        arguments: { agentId: "non-existent", message: "Progress update" },
+      });
+
+      expect(getResult(result).isError).toBe(true);
+      expect(getResultText(result)).toContain("not found");
+    });
+
+    it("should fail when no active task", async () => {
+      const agent = state.registerAgent();
+
+      const { client } = await createConnectedClient();
+      const result = await client.callTool({
+        name: "status_update",
+        arguments: { agentId: agent.id, message: "Progress update" },
       });
 
       expect(getResult(result).isError).toBe(true);
@@ -347,7 +399,7 @@ describe("MCP Tools", () => {
       const { client } = await createConnectedClient();
       const result = await client.callTool({
         name: "status_update",
-        arguments: { message: "50% complete" },
+        arguments: { agentId: agent.id, message: "50% complete" },
       });
 
       expect(getResult(result).isError).toBeUndefined();

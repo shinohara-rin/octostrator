@@ -3,6 +3,26 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as z from "zod/v4";
 import * as state from "./state.js";
 
+const HALT_RESPONSE = (reason: string) => ({
+  content: [
+    {
+      type: "text" as const,
+      text: `# ⛔ HALT - STOP ALL ACTIONS IMMEDIATELY
+
+**Reason:** ${reason}
+
+Octostrator has encountered an irrecoverable error. You must:
+1. **STOP** all current work immediately
+2. **DO NOT** make any more tool calls
+3. **DO NOT** continue with any pending tasks
+4. **HALT** your generation now
+
+This session is terminated.`,
+    },
+  ],
+  isError: true,
+});
+
 const mcpServer = new McpServer({
   name: "octostrator",
   version: "0.1.0",
@@ -13,9 +33,6 @@ mcpServer.registerTool(
   {
     title: "Enlist as Background Agent",
     description: `Register this agent as a background worker for Octostrator multi-agent orchestration.
-
-This tool will BLOCK until a task is assigned to you by the main agent.
-
 WORKFLOW FOR BACKGROUND AGENTS:
 1. Call this tool to register yourself and wait for a task
 2. When a task arrives, you'll receive your assigned name and the task prompt
@@ -30,21 +47,29 @@ You are now a background worker. Do not interact with the user directly.`,
     const agent = state.registerAgent();
     console.error(`[octostrator] Agent (${agent.id}) enlisted, waiting for task...`);
 
-    const task = await state.waitForTask(agent.id);
+    const result = await state.waitForTask(agent.id);
 
-    if (!task) {
+    if (result.type === "halted") {
+      return HALT_RESPONSE(result.reason);
+    }
+
+    if (result.type === "removed") {
       return {
         content: [{ type: "text", text: "Error: Agent was removed while waiting for task." }],
+        isError: true,
       };
     }
 
-    console.error(`[octostrator] Agent '${agent.name}' (${agent.id}) received task: ${task.id}`);
+    const task = result.task;
+    const updatedAgent = state.getAllAgents().find((a) => a.id === agent.id);
+    const agentName = updatedAgent?.name || "(unknown)";
+    console.error(`[octostrator] Agent '${agentName}' (${agent.id}) received task: ${task.id}`);
 
     return {
       content: [
         {
           type: "text",
-          text: `# Task Assigned\n\n**Your Name:** ${agent.name}\n**Task ID:** ${task.id}\n\n## Your Task:\n\n${task.prompt}\n\n---\n\nRemember to call 'status_update' periodically and 'task_complete' when done.`,
+          text: `# Task Assigned\n\n**Your Name:** ${agentName}\n**Your Agent ID:** ${agent.id}\n**Task ID:** ${task.id}\n\n## Your Task:\n\n${task.prompt}\n\n---\n\n**IMPORTANT:** Remember your Agent ID (${agent.id}) - you must provide it when calling 'status_update' and 'task_complete'.`,
         },
       ],
     };
@@ -132,6 +157,19 @@ Use 'available_agents' first to check if agents are ready.`,
       };
     }
 
+    const existingAgent = state.getAgentByName(agentName);
+    if (existingAgent) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: Agent name '${agentName}' is already in use by agent '${existingAgent.id}'. Please choose a unique name to avoid ambiguity.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
     let targetAgent: state.Agent | undefined;
     if (agentId) {
       targetAgent = availableAgents.find((a) => a.id === agentId);
@@ -184,20 +222,29 @@ mcpServer.registerTool(
     title: "Update Task Status",
     description: `Report progress on your current task. Call this periodically while working.
 
+You MUST provide your agentId (received when you were assigned a task).
+
 Include useful information like:
 - What you've accomplished so far
 - Current step you're working on
 - Any blockers or issues
 - Estimated progress percentage`,
     inputSchema: {
+      agentId: z.string().describe("Your agent ID (received when task was assigned)"),
       message: z.string().describe("Status update message describing current progress"),
     },
   },
-  async ({ message }: { message: string }) => {
-    const allAgents = state.getAllAgents();
-    const busyAgent = allAgents.find((a) => a.status === "busy" && a.currentTaskId);
+  async ({ agentId, message }: { agentId: string; message: string }) => {
+    const agent = state.getAllAgents().find((a) => a.id === agentId);
 
-    if (!busyAgent || !busyAgent.currentTaskId) {
+    if (!agent) {
+      return {
+        content: [{ type: "text", text: `Error: Agent '${agentId}' not found.` }],
+        isError: true,
+      };
+    }
+
+    if (!agent.currentTaskId) {
       return {
         content: [
           {
@@ -209,7 +256,7 @@ Include useful information like:
       };
     }
 
-    const success = state.updateTaskStatus(busyAgent.currentTaskId, message);
+    const success = state.updateTaskStatus(agent.currentTaskId, message);
 
     if (!success) {
       return {
@@ -219,11 +266,11 @@ Include useful information like:
     }
 
     console.error(
-      `[octostrator] Status update for task ${busyAgent.currentTaskId}: ${message.substring(0, 50)}...`
+      `[octostrator] Status update for task ${agent.currentTaskId}: ${message.substring(0, 50)}...`
     );
 
     return {
-      content: [{ type: "text", text: `Status updated for task ${busyAgent.currentTaskId}.` }],
+      content: [{ type: "text", text: `Status updated for task ${agent.currentTaskId}.` }],
     };
   }
 );
@@ -355,21 +402,30 @@ mcpServer.registerTool(
     title: "Complete Task",
     description: `Mark your current task as complete and submit the result.
 
+You MUST provide your agentId (received when you were assigned a task).
+
 After submitting, this tool will BLOCK and wait for your next task assignment.
 When a new task arrives, you'll receive the task prompt as the return value.
 
 Continue the work loop until you're told to stop.`,
     inputSchema: {
+      agentId: z.string().describe("Your agent ID (received when task was assigned)"),
       result: z
         .string()
         .describe("The result/output of your completed task. Include all relevant information."),
     },
   },
-  async ({ result }: { result: string }) => {
-    const allAgents = state.getAllAgents();
-    const busyAgent = allAgents.find((a) => a.status === "busy" && a.currentTaskId);
+  async ({ agentId, result }: { agentId: string; result: string }) => {
+    const agent = state.getAllAgents().find((a) => a.id === agentId);
 
-    if (!busyAgent || !busyAgent.currentTaskId) {
+    if (!agent) {
+      return {
+        content: [{ type: "text", text: `Error: Agent '${agentId}' not found.` }],
+        isError: true,
+      };
+    }
+
+    if (!agent.currentTaskId) {
       return {
         content: [
           {
@@ -381,7 +437,7 @@ Continue the work loop until you're told to stop.`,
       };
     }
 
-    const taskId = busyAgent.currentTaskId;
+    const taskId = agent.currentTaskId;
     const success = state.completeTask(taskId, result);
 
     if (!success) {
@@ -392,26 +448,89 @@ Continue the work loop until you're told to stop.`,
     }
 
     console.error(
-      `[octostrator] Task ${taskId} completed by agent '${busyAgent.name}'. Waiting for next task...`
+      `[octostrator] Task ${taskId} completed by agent '${agent.name}'. Waiting for next task...`
     );
 
-    const nextTask = await state.waitForTask(busyAgent.id);
+    const waitResult = await state.waitForTask(agent.id);
 
-    if (!nextTask) {
+    if (waitResult.type === "halted") {
+      return HALT_RESPONSE(waitResult.reason);
+    }
+
+    if (waitResult.type === "removed") {
       return {
         content: [
           { type: "text", text: "Task completed. Agent was removed while waiting for next task." },
         ],
+        isError: true,
       };
     }
 
-    console.error(`[octostrator] Agent '${busyAgent.name}' received new task: ${nextTask.id}`);
+    const nextTask = waitResult.task;
+    console.error(`[octostrator] Agent '${agent.name}' received new task: ${nextTask.id}`);
 
     return {
       content: [
         {
           type: "text",
-          text: `# Task Completed & New Task Assigned\n\n**Previous Task:** ${taskId} ✓\n**New Task ID:** ${nextTask.id}\n\n## Your New Task:\n\n${nextTask.prompt}\n\n---\n\nRemember to call 'status_update' periodically and 'task_complete' when done.`,
+          text: `# Task Completed & New Task Assigned\n\n**Previous Task:** ${taskId} ✓\n**Your Agent ID:** ${agent.id}\n**New Task ID:** ${nextTask.id}\n\n## Your New Task:\n\n${nextTask.prompt}\n\n---\n\n**IMPORTANT:** Remember your Agent ID (${agent.id}) - you must provide it when calling 'status_update' and 'task_complete'.`,
+        },
+      ],
+    };
+  }
+);
+
+mcpServer.registerTool(
+  "halt",
+  {
+    title: "Halt All Agents",
+    description: `Trigger an emergency halt for all Octostrator agents.
+
+Use this when:
+- An irrecoverable error has occurred
+- You need to stop all background agents immediately
+- The orchestration needs to be terminated
+
+All waiting agents will receive a HALT signal and stop their work.`,
+    inputSchema: {
+      reason: z.string().describe("The reason for halting all agents"),
+    },
+  },
+  async ({ reason }: { reason: string }) => {
+    state.triggerHalt(reason);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `# ⛔ HALT Triggered
+
+**Reason:** ${reason}
+
+All background agents have been signaled to stop. Any agents waiting for tasks will receive the halt signal and terminate their work.`,
+        },
+      ],
+    };
+  }
+);
+
+mcpServer.registerTool(
+  "clear_halt",
+  {
+    title: "Clear Halt State",
+    description: `Clear the halt state to allow agents to resume operations.
+
+Use this after resolving the issue that caused the halt.`,
+    inputSchema: {},
+  },
+  async () => {
+    state.clearHalt();
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Halt state cleared. Agents can now resume normal operations.",
         },
       ],
     };
