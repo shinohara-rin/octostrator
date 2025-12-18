@@ -55,3 +55,7 @@ Mark the current task as complete and submit the result. This tool blocks until 
 ### Conflict resolution
 
 Octostrator manages git worktrees for agents that need to read/write concurrently. This avoids conflicts between agents.
+
+## TODO
+
+- [ ] Create a dedicated CLI tool for monitoring state and performing cleanup operations (e.g. pruning old tasks).
