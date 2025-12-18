@@ -1,8 +1,10 @@
 import * as fs from "fs";
 import * as path from "path";
+import * as lockfile from "proper-lockfile";
 
 const STATE_FILE = path.join(process.cwd(), ".octostrator-state.json");
 const POLL_INTERVAL_MS = 500;
+const LOCK_OPTIONS_SYNC = { stale: 10000 };
 
 export interface Agent {
   id: string;
@@ -28,25 +30,58 @@ export interface Task {
   completedAt: number | null;
 }
 
+export interface HaltInfo {
+  halted: boolean;
+  reason: string | null;
+  timestamp: number | null;
+}
+
 export interface State {
   agents: Record<string, Agent>;
   tasks: Record<string, Task>;
+  halt: HaltInfo;
+}
+
+const DEFAULT_HALT: HaltInfo = { halted: false, reason: null, timestamp: null };
+
+function ensureStateFile(): void {
+  try {
+    fs.writeFileSync(
+      STATE_FILE,
+      JSON.stringify({ agents: {}, tasks: {}, halt: DEFAULT_HALT }, null, 2),
+      { flag: "wx" }
+    );
+  } catch {
+    // File already exists or other error - ignore, we'll read it
+  }
 }
 
 function readState(): State {
   try {
-    if (fs.existsSync(STATE_FILE)) {
-      const data = fs.readFileSync(STATE_FILE, "utf-8");
-      return JSON.parse(data);
-    }
+    ensureStateFile();
+    const data = fs.readFileSync(STATE_FILE, "utf-8");
+    return JSON.parse(data);
   } catch (error) {
     console.error("Error reading state file:", error);
   }
-  return { agents: {}, tasks: {} };
+  return { agents: {}, tasks: {}, halt: DEFAULT_HALT };
 }
 
+// Always acquire a lock before writing to the state file
 function writeState(state: State): void {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  const tempFile = `${STATE_FILE}.tmp`;
+  fs.writeFileSync(tempFile, JSON.stringify(state, null, 2));
+  fs.renameSync(tempFile, STATE_FILE);
+}
+
+function withLock<T>(fn: () => T): T {
+  ensureStateFile();
+  const release = lockfile.lockSync(STATE_FILE, LOCK_OPTIONS_SYNC);
+  try {
+    return fn();
+  } finally {
+    release();
+  }
 }
 
 function generateId(): string {
@@ -54,18 +89,20 @@ function generateId(): string {
 }
 
 export function registerAgent(): Agent {
-  const state = readState();
-  const id = generateId();
-  const agent: Agent = {
-    id,
-    name: null,
-    status: "idle",
-    currentTaskId: null,
-    enlistedAt: Date.now(),
-  };
-  state.agents[id] = agent;
-  writeState(state);
-  return agent;
+  return withLock(() => {
+    const state = readState();
+    const id = generateId();
+    const agent: Agent = {
+      id,
+      name: null,
+      status: "idle",
+      currentTaskId: null,
+      enlistedAt: Date.now(),
+    };
+    state.agents[id] = agent;
+    writeState(state);
+    return agent;
+  });
 }
 
 export function getAvailableAgents(): Agent[] {
@@ -79,40 +116,44 @@ export function getAllAgents(): Agent[] {
 }
 
 export function createTask(prompt: string): Task {
-  const state = readState();
-  const id = generateId();
-  const task: Task = {
-    id,
-    agentId: null,
-    prompt,
-    status: "pending",
-    updates: [],
-    result: null,
-    createdAt: Date.now(),
-    completedAt: null,
-  };
-  state.tasks[id] = task;
-  writeState(state);
-  return task;
+  return withLock(() => {
+    const state = readState();
+    const id = generateId();
+    const task: Task = {
+      id,
+      agentId: null,
+      prompt,
+      status: "pending",
+      updates: [],
+      result: null,
+      createdAt: Date.now(),
+      completedAt: null,
+    };
+    state.tasks[id] = task;
+    writeState(state);
+    return task;
+  });
 }
 
 export function assignTaskToAgent(taskId: string, agentId: string, agentName: string): boolean {
-  const state = readState();
-  const task = state.tasks[taskId];
-  const agent = state.agents[agentId];
+  return withLock(() => {
+    const state = readState();
+    const task = state.tasks[taskId];
+    const agent = state.agents[agentId];
 
-  if (!task || !agent || agent.status !== "idle") {
-    return false;
-  }
+    if (!task || !agent || agent.status !== "idle") {
+      return false;
+    }
 
-  task.agentId = agentId;
-  task.status = "in_progress";
-  agent.status = "busy";
-  agent.currentTaskId = taskId;
-  agent.name = agentName;
+    task.agentId = agentId;
+    task.status = "in_progress";
+    agent.status = "busy";
+    agent.currentTaskId = taskId;
+    agent.name = agentName;
 
-  writeState(state);
-  return true;
+    writeState(state);
+    return true;
+  });
 }
 
 export function getAgentByName(name: string): Agent | null {
@@ -130,42 +171,46 @@ export function getTaskForAgent(agentId: string): Task | null {
 }
 
 export function updateTaskStatus(taskId: string, message: string): boolean {
-  const state = readState();
-  const task = state.tasks[taskId];
-  if (!task || task.status !== "in_progress") {
-    return false;
-  }
+  return withLock(() => {
+    const state = readState();
+    const task = state.tasks[taskId];
+    if (!task || task.status !== "in_progress") {
+      return false;
+    }
 
-  task.updates.push({
-    timestamp: Date.now(),
-    message,
+    task.updates.push({
+      timestamp: Date.now(),
+      message,
+    });
+
+    writeState(state);
+    return true;
   });
-
-  writeState(state);
-  return true;
 }
 
 export function completeTask(taskId: string, result: string): boolean {
-  const state = readState();
-  const task = state.tasks[taskId];
-  if (!task || task.status !== "in_progress") {
-    return false;
-  }
-
-  task.status = "completed";
-  task.result = result;
-  task.completedAt = Date.now();
-
-  if (task.agentId) {
-    const agent = state.agents[task.agentId];
-    if (agent) {
-      agent.status = "idle";
-      agent.currentTaskId = null;
+  return withLock(() => {
+    const state = readState();
+    const task = state.tasks[taskId];
+    if (!task || task.status !== "in_progress") {
+      return false;
     }
-  }
 
-  writeState(state);
-  return true;
+    task.status = "completed";
+    task.result = result;
+    task.completedAt = Date.now();
+
+    if (task.agentId) {
+      const agent = state.agents[task.agentId];
+      if (agent) {
+        agent.status = "idle";
+        agent.currentTaskId = null;
+      }
+    }
+
+    writeState(state);
+    return true;
+  });
 }
 
 export function getTask(taskId: string): Task | null {
@@ -183,19 +228,29 @@ export function getAgentTasks(agentId: string): Task[] {
   return Object.values(state.tasks).filter((t) => t.agentId === agentId);
 }
 
-export async function waitForTask(agentId: string): Promise<Task | null> {
+export type WaitResult =
+  | { type: "task"; task: Task }
+  | { type: "removed" }
+  | { type: "halted"; reason: string };
+
+export async function waitForTask(agentId: string): Promise<WaitResult> {
   while (true) {
     const state = readState();
+
+    if (state.halt?.halted) {
+      return { type: "halted", reason: state.halt.reason || "Unknown error" };
+    }
+
     const agent = state.agents[agentId];
 
     if (!agent) {
-      return null;
+      return { type: "removed" };
     }
 
     if (agent.status === "busy" && agent.currentTaskId) {
       const task = state.tasks[agent.currentTaskId];
       if (task && task.status === "in_progress") {
-        return task;
+        return { type: "task", task };
       }
     }
 
@@ -204,15 +259,50 @@ export async function waitForTask(agentId: string): Promise<Task | null> {
 }
 
 export function removeAgent(agentId: string): boolean {
-  const state = readState();
-  if (!state.agents[agentId]) {
-    return false;
-  }
-  delete state.agents[agentId];
-  writeState(state);
-  return true;
+  return withLock(() => {
+    const state = readState();
+    if (!state.agents[agentId]) {
+      return false;
+    }
+    delete state.agents[agentId];
+    writeState(state);
+    return true;
+  });
 }
 
 export function clearState(): void {
-  writeState({ agents: {}, tasks: {} });
+  withLock(() => {
+    writeState({ agents: {}, tasks: {}, halt: DEFAULT_HALT });
+  });
+}
+
+export function triggerHalt(reason: string): void {
+  withLock(() => {
+    const state = readState();
+    state.halt = {
+      halted: true,
+      reason,
+      timestamp: Date.now(),
+    };
+    writeState(state);
+  });
+  console.error(`[octostrator] HALT triggered: ${reason}`);
+}
+
+export function getHaltStatus(): HaltInfo {
+  const state = readState();
+  return state.halt || DEFAULT_HALT;
+}
+
+export function clearHalt(): void {
+  withLock(() => {
+    const state = readState();
+    state.halt = DEFAULT_HALT;
+    writeState(state);
+  });
+}
+
+export function isHalted(): boolean {
+  const state = readState();
+  return state.halt?.halted ?? false;
 }

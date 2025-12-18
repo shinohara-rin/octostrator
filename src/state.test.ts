@@ -17,6 +17,10 @@ import {
   removeAgent,
   clearState,
   waitForTask,
+  triggerHalt,
+  isHalted,
+  clearHalt,
+  getHaltStatus,
 } from "./state.js";
 
 const STATE_FILE = path.join(process.cwd(), ".octostrator-state.json");
@@ -300,7 +304,7 @@ describe("State Management", () => {
   });
 
   describe("waitForTask", () => {
-    it("should return null if agent is removed", async () => {
+    it("should return removed when agent is removed", async () => {
       const agent = registerAgent();
 
       const waitPromise = waitForTask(agent.id);
@@ -309,7 +313,7 @@ describe("State Management", () => {
       removeAgent(agent.id);
 
       const result = await waitPromise;
-      expect(result).toBeNull();
+      expect(result.type).toBe("removed");
     });
 
     it("should return task when assigned", async () => {
@@ -322,8 +326,51 @@ describe("State Management", () => {
       assignTaskToAgent(task.id, agent.id, "Worker");
 
       const result = await waitPromise;
-      expect(result).not.toBeNull();
-      expect(result?.id).toBe(task.id);
+      expect(result.type).toBe("task");
+      if (result.type === "task") {
+        expect(result.task.id).toBe(task.id);
+      }
+    });
+  });
+
+  describe("Halt Management", () => {
+    it("should trigger halt with reason", () => {
+      expect(isHalted()).toBe(false);
+
+      triggerHalt("Test error");
+
+      expect(isHalted()).toBe(true);
+      const status = getHaltStatus();
+      expect(status.halted).toBe(true);
+      expect(status.reason).toBe("Test error");
+      expect(status.timestamp).toBeDefined();
+    });
+
+    it("should clear halt state", () => {
+      triggerHalt("Test error");
+      expect(isHalted()).toBe(true);
+
+      clearHalt();
+
+      expect(isHalted()).toBe(false);
+      const status = getHaltStatus();
+      expect(status.halted).toBe(false);
+      expect(status.reason).toBeNull();
+    });
+
+    it("should return halted when waitForTask detects halt", async () => {
+      const agent = registerAgent();
+
+      const waitPromise = waitForTask(agent.id);
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      triggerHalt("Emergency shutdown");
+
+      const result = await waitPromise;
+      expect(result.type).toBe("halted");
+      if (result.type === "halted") {
+        expect(result.reason).toBe("Emergency shutdown");
+      }
     });
   });
 
