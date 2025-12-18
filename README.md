@@ -20,6 +20,36 @@ Create multiple background chat sessions in your IDE and let Octostrator take ca
 
 Whenever you issue a complex task that can make use of multi-agent collaboration, Octostrator will automatically delegate chunked tasks to background agents.
 
+## Usage
+
+### Local Development (Recommended)
+
+To use Octostrator locally
+
+1. Link the package globally:
+   ```bash
+   pnpm link --global
+   ```
+2. Now you can run it simply as:
+   ```bash
+   octostrator
+   ```
+
+### Configuration in Windsurf
+
+Add this to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "octostrator": {
+      "command": "octostrator",
+      "args": []
+    }
+  }
+}
+```
+
 ## Tools
 
 ### `enlist`
