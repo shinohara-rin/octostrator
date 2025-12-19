@@ -24,16 +24,29 @@ import {
 } from "./state.js";
 
 const STATE_FILE = path.join(process.cwd(), ".octostrator-state.json");
+const LOCK_FILE = `${STATE_FILE}.lock`;
+
+function cleanupFiles(): void {
+  try {
+    fs.rmSync(LOCK_FILE, { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+  try {
+    fs.unlinkSync(STATE_FILE);
+  } catch {
+    // ignore
+  }
+}
 
 describe("State Management", () => {
   beforeEach(() => {
+    cleanupFiles();
     clearState();
   });
 
   afterEach(() => {
-    if (fs.existsSync(STATE_FILE)) {
-      fs.unlinkSync(STATE_FILE);
-    }
+    cleanupFiles();
   });
 
   describe("Agent Management", () => {

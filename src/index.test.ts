@@ -8,6 +8,20 @@ import * as path from "path";
 import * as state from "./state.js";
 
 const STATE_FILE = path.join(process.cwd(), ".octostrator-state.json");
+const LOCK_FILE = `${STATE_FILE}.lock`;
+
+function cleanupFiles(): void {
+  try {
+    fs.rmSync(LOCK_FILE, { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+  try {
+    fs.unlinkSync(STATE_FILE);
+  } catch {
+    // ignore
+  }
+}
 
 interface ToolResult {
   content: Array<{ type: string; text: string }>;
@@ -262,13 +276,12 @@ async function createConnectedClient(): Promise<{ client: Client; server: McpSer
 
 describe("MCP Tools", () => {
   beforeEach(() => {
+    cleanupFiles();
     state.clearState();
   });
 
   afterEach(() => {
-    if (fs.existsSync(STATE_FILE)) {
-      fs.unlinkSync(STATE_FILE);
-    }
+    cleanupFiles();
   });
 
   describe("available_agents", () => {
