@@ -111,6 +111,25 @@ describe("State Management", () => {
       const removed = removeAgent("non-existent-id");
       expect(removed).toBe(false);
     });
+
+    it("should reset in-progress task to pending when agent is removed", () => {
+      const agent = registerAgent();
+      const task = createTask("Test task");
+      assignTaskToAgent(task.id, agent.id, "Worker");
+
+      // Verify initial state
+      let updatedTask = getTask(task.id);
+      expect(updatedTask?.status).toBe("in_progress");
+      expect(updatedTask?.agentId).toBe(agent.id);
+
+      // Remove agent
+      removeAgent(agent.id);
+
+      // Verify task was reset
+      updatedTask = getTask(task.id);
+      expect(updatedTask?.status).toBe("pending");
+      expect(updatedTask?.agentId).toBeNull();
+    });
   });
 
   describe("Task Management", () => {
