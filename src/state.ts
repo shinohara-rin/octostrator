@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as lockfile from "proper-lockfile";
+import { randomUUID } from "crypto";
 
 const STATE_FILE = path.join(process.cwd(), ".octostrator-state.json");
 const POLL_INTERVAL_MS = 500;
@@ -85,7 +86,7 @@ function withLock<T>(fn: () => T): T {
 }
 
 function generateId(): string {
-  return Math.random().toString(36).substring(2, 10);
+  return randomUUID();
 }
 
 export function registerAgent(): Agent {
@@ -141,7 +142,7 @@ export function assignTaskToAgent(taskId: string, agentId: string, agentName: st
     const task = state.tasks[taskId];
     const agent = state.agents[agentId];
 
-    if (!task || !agent || agent.status !== "idle") {
+    if (!task || !agent || agent.status !== "idle" || task.status !== "pending") {
       return false;
     }
 
@@ -261,8 +262,16 @@ export async function waitForTask(agentId: string): Promise<WaitResult> {
 export function removeAgent(agentId: string): boolean {
   return withLock(() => {
     const state = readState();
-    if (!state.agents[agentId]) {
+    const agent = state.agents[agentId];
+    if (!agent) {
       return false;
+    }
+    if (agent.currentTaskId) {
+      const task = state.tasks[agent.currentTaskId];
+      if (task && task.status === "in_progress") {
+        task.status = "pending";
+        task.agentId = null;
+      }
     }
     delete state.agents[agentId];
     writeState(state);
