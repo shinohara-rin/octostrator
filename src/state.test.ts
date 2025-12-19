@@ -403,4 +403,181 @@ describe("State Management", () => {
       expect(getAllTasks()).toHaveLength(0);
     });
   });
+
+  describe("Concurrency and Race Conditions", () => {
+    it("should handle concurrent agent registrations", async () => {
+      const registrations = Array.from({ length: 10 }, () =>
+        Promise.resolve().then(() => registerAgent())
+      );
+
+      const agents = await Promise.all(registrations);
+
+      // All agents should have unique IDs
+      const ids = agents.map((a) => a.id);
+      const uniqueIds = new Set(ids);
+      expect(uniqueIds.size).toBe(10);
+
+      // All agents should be persisted
+      expect(getAllAgents()).toHaveLength(10);
+    });
+
+    it("should handle concurrent task creations", async () => {
+      const creations = Array.from({ length: 10 }, (_, i) =>
+        Promise.resolve().then(() => createTask(`Task ${i}`))
+      );
+
+      const tasks = await Promise.all(creations);
+
+      const ids = tasks.map((t) => t.id);
+      const uniqueIds = new Set(ids);
+      expect(uniqueIds.size).toBe(10);
+
+      expect(getAllTasks()).toHaveLength(10);
+    });
+
+    it("should handle concurrent status updates on same task", async () => {
+      const agent = registerAgent();
+      const task = createTask("Test task");
+      assignTaskToAgent(task.id, agent.id, "Worker");
+
+      const updates = Array.from({ length: 5 }, (_, i) =>
+        Promise.resolve().then(() => updateTaskStatus(task.id, `Update ${i}`))
+      );
+
+      const results = await Promise.all(updates);
+
+      // All updates should succeed
+      expect(results.every((r) => r === true)).toBe(true);
+
+      const updatedTask = getTask(task.id);
+      expect(updatedTask?.updates).toHaveLength(5);
+    });
+
+    it("should prevent double assignment of same task", async () => {
+      const agent1 = registerAgent();
+      const agent2 = registerAgent();
+      const task = createTask("Test task");
+
+      // Try to assign same task to both agents concurrently
+      const assignments = [
+        Promise.resolve().then(() => assignTaskToAgent(task.id, agent1.id, "Worker1")),
+        Promise.resolve().then(() => assignTaskToAgent(task.id, agent2.id, "Worker2")),
+      ];
+
+      const results = await Promise.all(assignments);
+
+      // Only one should succeed (task can only be assigned once)
+      const successCount = results.filter((r) => r === true).length;
+      expect(successCount).toBe(1);
+
+      // Task should be in_progress with one agent
+      const updatedTask = getTask(task.id);
+      expect(updatedTask?.status).toBe("in_progress");
+      expect(updatedTask?.agentId).toBeDefined();
+    });
+
+    it("should prevent assigning multiple tasks to same agent", async () => {
+      const agent = registerAgent();
+      const task1 = createTask("Task 1");
+      const task2 = createTask("Task 2");
+
+      // Assign first task
+      const result1 = assignTaskToAgent(task1.id, agent.id, "Worker");
+      expect(result1).toBe(true);
+
+      // Try to assign second task to busy agent
+      const result2 = assignTaskToAgent(task2.id, agent.id, "Worker");
+      expect(result2).toBe(false);
+
+      // Agent should only have first task
+      const agentTask = getTaskForAgent(agent.id);
+      expect(agentTask?.id).toBe(task1.id);
+    });
+
+    it("should handle rapid waitForTask polling with state changes", async () => {
+      const agent = registerAgent();
+
+      // Start waiting
+      const waitPromise = waitForTask(agent.id);
+
+      // Rapidly create and assign task
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const task = createTask("Rapid task");
+      assignTaskToAgent(task.id, agent.id, "Worker");
+
+      const result = await waitPromise;
+      expect(result.type).toBe("task");
+      if (result.type === "task") {
+        expect(result.task.id).toBe(task.id);
+      }
+    });
+
+    it("should handle waitForTask when agent removed during poll", async () => {
+      const agent = registerAgent();
+
+      const waitPromise = waitForTask(agent.id);
+
+      // Remove agent while waiting
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      removeAgent(agent.id);
+
+      const result = await waitPromise;
+      expect(result.type).toBe("removed");
+    });
+
+    it("should handle concurrent complete and status update", async () => {
+      const agent = registerAgent();
+      const task = createTask("Test task");
+      assignTaskToAgent(task.id, agent.id, "Worker");
+
+      // Try to complete and update status concurrently
+      const operations = [
+        Promise.resolve().then(() => completeTask(task.id, "Done")),
+        Promise.resolve().then(() => updateTaskStatus(task.id, "Final update")),
+      ];
+
+      const results = await Promise.all(operations);
+
+      // At least one should succeed
+      expect(results.some((r) => r === true)).toBe(true);
+
+      // Task should be completed
+      const updatedTask = getTask(task.id);
+      expect(updatedTask?.status).toBe("completed");
+    });
+
+    it("should handle multiple waitForTask on same agent", async () => {
+      const agent = registerAgent();
+
+      // Start multiple waits (simulating reconnection scenario)
+      const wait1 = waitForTask(agent.id);
+      const wait2 = waitForTask(agent.id);
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const task = createTask("Test task");
+      assignTaskToAgent(task.id, agent.id, "Worker");
+
+      const [result1, result2] = await Promise.all([wait1, wait2]);
+
+      // Both should get the task
+      expect(result1.type).toBe("task");
+      expect(result2.type).toBe("task");
+    });
+
+    it("should handle halt during concurrent operations", async () => {
+      const agent1 = registerAgent();
+      const agent2 = registerAgent();
+
+      const wait1 = waitForTask(agent1.id);
+      const wait2 = waitForTask(agent2.id);
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      triggerHalt("Emergency stop");
+
+      const [result1, result2] = await Promise.all([wait1, wait2]);
+
+      expect(result1.type).toBe("halted");
+      expect(result2.type).toBe("halted");
+    });
+  });
 });
